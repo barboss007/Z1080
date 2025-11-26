@@ -1,0 +1,21 @@
+# ---- Python cache ----
+__pycache__/
+*.pyc
+
+# ---- Build artifacts ----
+build/
+dist/
+*.spec
+*.egg-info/
+*.whl
+*.tar.gz
+
+# ---- Executables ----
+*.exe
+
+# ---- IDE ----
+.vscode/
+.idea/
+
+# ---- Misc ----
+*.log
