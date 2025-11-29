@@ -19,3 +19,11 @@ dist/
 
 # ---- Misc ----
 *.log
+# Z1080 / ZVault stuff
+*.zvault
+*.exe
+*.spec
+__pycache__/
+ZVAULT_REEASE/
+ZVAULT_RELEASE/
+*.log
