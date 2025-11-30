@@ -9,11 +9,6 @@ jobs:
   build-windows:
     runs-on: windows-latest
 
-    # Використовуємо PowerShell для зручних `\` у командах
-    defaults:
-      run:
-        shell: pwsh
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,29 +21,27 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install cryptography pyinstaller
+          pip install pyinstaller cryptography pyperclip
 
       # ---- Build CLI EXE ----
       - name: Build CLI executable
         run: |
-          pyinstaller `
-            --onefile `
-            --name Z1080_CLI `
-            --hidden-import cryptography `
+          pyinstaller ^
+            --onefile ^
+            --name Z1080_CLI ^
             src/z1080/cli.py
 
       # ---- Build GUI EXE ----
       - name: Build GUI executable
         run: |
-          pyinstaller `
-            --onefile `
-            --windowed `
-            --name Z1080_GUI `
-            --hidden-import cryptography `
+          pyinstaller ^
+            --onefile ^
+            --windowed ^
+            --name Z1080_GUI ^
             src/z1080/gui.py
 
       # ---- Save Built Artifacts ----
-      - name: Upload build artifacts
+      - name: Upload build output
         uses: actions/upload-artifact@v4
         with:
           name: Z1080-build

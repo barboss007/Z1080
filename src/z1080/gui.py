@@ -1,796 +1,204 @@
 import os
-import sys
-import json
-import shutil
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, simpledialog
+from tkinter import filedialog, messagebox, ttk
 import secrets
-import string
+import pyperclip
 from datetime import datetime
 
-# --- Імпорти ядра сейфу ---------------------------------------------
-try:
-    # Звичайний шлях: пакет z1080 (і в EXE, і при python -m z1080.gui)
-    from z1080.crypto import save_zvault, load_zvault
-except ImportError:
-    # Резервний варіант: якщо файл лежить поруч як crypto.py
-    from .crypto import save_zvault, load_zvault
+# ---- Unicode full-spectrum alphabet (≈149 000 символів) ----
+# Додані ключові групи Unicode: латиниця, грецька, кандзі, математичні символи, emoji, технічні символи.
+UNICODE_ALPHABET = "".join(
+    chr(i) for i in range(0x20, 0x1FAF0)
+    if (
+        chr(i).isprintable()
+        and not chr(i).isspace()
+        and i not in range(0x7F, 0xA0)
+    )
+)
 
-class SimpleVault:
-    """Мінімальний контейнер, щоб мати self.vault.entries."""
-    def __init__(self, entries=None):
-        if entries is None:
-            entries = []
-        self.entries = entries
+# ---- Import backend ----
+try:
+    # Normal run via package
+    from z1080.crypto import save_zvault, load_zvault, generate_passglyph_password
+except ImportError:
+    # Running as standalone script (PyInstaller mode)
+    from crypto import save_zvault, load_zvault, generate_passglyph_password
+
 
 
 class ZVaultApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Z1080 Secure Vault")
+        self.vault_path = None
+        self.vault_entries = []
+        self.master_password = None
 
-        self.vault = None           # SimpleVault
-        self.vault_path = None      # шлях до файлу .zvault
-        self.master_password = None # поки що просто зберігаємо
+        self._build_ui()
 
-        # Статус блокування сейфу
-        self.is_locked = False
-        self.idle_timeout_ms = 5 * 60 * 1000  # 5 хвилин неактивності
-        self.idle_job = None
+    # ---------------- GUI -----------------
 
-        self.icon_path = self.get_icon_path()
-        if self.icon_path:
-            try:
-                self.root.iconbitmap(self.icon_path)
-            except Exception:
-                pass
+    def _build_ui(self):
+        frame_top = tk.Frame(self.root)
+        frame_top.pack(pady=10)
 
-        self.setup_theme()
-        self.build_ui()
-        self.setup_idle_timer_bindings()
+        btn_open = tk.Button(frame_top, text="Open Vault", command=self.open_vault)
+        btn_open.grid(row=0, column=0, padx=5)
 
-    # ------------------------------------------------------------------ #
-    # Пошук іконки (працює і в .exe)
-    # ------------------------------------------------------------------ #
-    def get_icon_path(self) -> str | None:
-        """Знайти zvault.ico поруч із скриптом або в каталозі PyInstaller."""
-        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
-        icon_path = os.path.join(base_dir, "zvault.ico")
-        return icon_path if os.path.exists(icon_path) else None
+        btn_save = tk.Button(frame_top, text="Save Vault", command=self.save_vault)
+        btn_save.grid(row=0, column=1, padx=5)
 
-    # ------------------------------------------------------------------ #
-    # ТЕМА (Dark Mode)
-    # ------------------------------------------------------------------ #
-    def setup_theme(self):
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+        btn_add = tk.Button(frame_top, text="Add Entry", command=self.add_entry_window)
+        btn_add.grid(row=0, column=2, padx=5)
 
-        bg = "#1e1e1e"
-        fg = "#ffffff"
-        accent = "#3a96dd"
-        entry_bg = "#2d2d30"
-        entry_fg = "#ffffff"
+        # Table
+        columns = ("Title", "Username", "URL", "Mode")
+        self.table = ttk.Treeview(self.root, columns=columns, show="headings")
+        for c in columns:
+            self.table.heading(c, text=c)
+            self.table.column(c, width=180)
+        self.table.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.root.configure(bg=bg)
+    # ---------------- Vault Ops -----------------
 
-        style.configure(
-            "TLabel",
-            background=bg,
-            foreground=fg,
-        )
-        style.configure(
-            "TButton",
-            padding=6,
-            background="#2d2d30",
-            foreground=fg,
-            borderwidth=1,
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#3c3c3c")],
-        )
-
-        style.configure(
-            "Treeview",
-            background="#252526",
-            foreground=fg,
-            fieldbackground="#252526",
-            rowheight=22,
-            borderwidth=0,
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", accent)],
-            foreground=[("selected", "#ffffff")],
-        )
-
-        style.configure(
-            "Treeview.Heading",
-            background="#3c3c3c",
-            foreground=fg,
-        )
-
-    # ------------------------------------------------------------------ #
-    # UI
-    # ------------------------------------------------------------------ #
-    def build_ui(self):
-        # ----- Меню (File / Vault) -----
-        menubar = tk.Menu(self.root, tearoff=0)
-
-        file_menu = tk.Menu(menubar, tearoff=0, bg="#2d2d30", fg="#ffffff")
-        file_menu.add_command(label="Export entries to JSON...", command=self.export_json)
-        file_menu.add_command(label="Import entries from JSON...", command=self.import_json)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
-        menubar.add_cascade(label="File", menu=file_menu)
-
-        vault_menu = tk.Menu(menubar, tearoff=0, bg="#2d2d30", fg="#ffffff")
-        vault_menu.add_command(
-            label="Lock now",
-            command=lambda: self.lock_vault(auto=False),
-            state="disabled",
-        )
-        vault_menu.add_command(
-            label="Unlock",
-            command=self.unlock_vault,
-            state="disabled",
-        )
-        menubar.add_cascade(label="Vault", menu=vault_menu)
-
-        self.root.config(menu=menubar)
-        self.vault_menu = vault_menu
-
-        # ----- Верхні кнопки -----
-        top_frame = ttk.Frame(self.root)
-        top_frame.pack(side="top", fill="x", padx=8, pady=8)
-
-        btn_frame = ttk.Frame(top_frame)
-        btn_frame.pack(side="left", anchor="w")
-
-        # НОВА КНОПКА: створення сейфа
-        self.btn_create = ttk.Button(btn_frame, text="Create Vault", command=self.create_vault)
-        self.btn_create.pack(side="left", padx=(0, 5))
-
-        self.btn_open = ttk.Button(btn_frame, text="Open Vault", command=self.open_vault)
-        self.btn_open.pack(side="left", padx=(0, 5))
-
-        self.btn_save = ttk.Button(btn_frame, text="Save Vault", command=self.save_vault)
-        self.btn_save.pack(side="left", padx=(0, 5))
-        self.btn_save.config(state="disabled")
-
-        self.btn_add = ttk.Button(btn_frame, text="Add Entry", command=self.add_entry_dialog)
-        self.btn_add.pack(side="left", padx=(0, 5))
-        self.btn_add.config(state="disabled")
-
-        # ----- Таблиця (Treeview) -----
-        tree_frame = ttk.Frame(self.root)
-        tree_frame.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
-
-        columns = ("title", "username", "website")
-        self.tree = ttk.Treeview(
-            tree_frame,
-            columns=columns,
-            show="headings",
-            selectmode="browse",
-        )
-        self.tree.heading("title", text="Title")
-        self.tree.heading("username", text="Username")
-        self.tree.heading("website", text="Website")
-
-        self.tree.column("title", width=250)
-        self.tree.column("username", width=150)
-        self.tree.column("website", width=300)
-
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscroll=vsb.set)
-
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        self.tree.bind("<Double-1>", self.on_tree_double_click)
-
-        # ----- Статус -----
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
-
-        self.status_label = ttk.Label(status_frame, text="No vault loaded")
-        self.status_label.pack(side="left")
-
-        self.lock_label = ttk.Label(status_frame, text="Unlocked", foreground="#00ff00")
-        self.lock_label.pack(side="right")
-
-    # ------------------------------------------------------------------ #
-    # Idle timer
-    # ------------------------------------------------------------------ #
-    def setup_idle_timer_bindings(self):
-        events = [
-            "<Motion>",
-            "<KeyPress>",
-            "<Button>",
-            "<ButtonRelease>",
-            "<MouseWheel>",
-        ]
-        for ev in events:
-            self.root.bind_all(ev, self.on_user_activity)
-
-        self.reset_idle_timer()
-
-    def on_user_activity(self, event=None):
-        if not self.is_locked and self.vault:
-            self.reset_idle_timer()
-
-    def reset_idle_timer(self):
-        if self.idle_job is not None:
-            self.root.after_cancel(self.idle_job)
-            self.idle_job = None
-
-        if self.vault and not self.is_locked:
-            self.idle_job = self.root.after(self.idle_timeout_ms, self.on_idle_timeout)
-
-    def on_idle_timeout(self):
-        self.lock_vault(auto=True)
-
-    # ------------------------------------------------------------------ #
-    # Створення нового сейфу
-    # ------------------------------------------------------------------ #
-    def create_vault(self):
-        filename = filedialog.asksaveasfilename(
-            title="Create new vault...",
-            defaultextension=".zvault",
-            filetypes=[("ZVault files", "*.zvault"), ("All files", "*.*")]
-        )
-        if not filename:
-            return
-
-        if not filename.lower().endswith(".zvault"):
-            filename += ".zvault"
-
-        pwd1 = simpledialog.askstring(
-            "Master Password",
-            "Enter new master password:",
-            show="*",
-            parent=self.root,
-        )
-        if not pwd1:
-            messagebox.showwarning("Password", "Master password is required.")
-            return
-
-        pwd2 = simpledialog.askstring(
-            "Confirm Password",
-            "Re-enter master password:",
-            show="*",
-            parent=self.root,
-        )
-        if pwd2 is None or pwd1 != pwd2:
-            messagebox.showerror("Password", "Passwords do not match.")
-            return
-
-        entries = []  # порожній сейф
-
-        try:
-            # створюємо зашифрований файл
-            save_zvault(filename, pwd1, entries)
-
-            # одразу відкриваємо його в GUI
-            self.vault = SimpleVault(entries)
-            self.vault_path = filename
-            self.master_password = pwd1
-            self.is_locked = False
-
-            self.refresh_entries()
-            self.btn_add.config(state="normal")
-            self.btn_save.config(state="normal")
-
-            if hasattr(self, "vault_menu"):
-                try:
-                    self.vault_menu.entryconfig("Lock now", state="normal")
-                    self.vault_menu.entryconfig("Unlock", state="disabled")
-                except Exception:
-                    pass
-
-            self.lock_label.config(text="Unlocked", foreground="#00ff00")
-            self.status_label.config(
-                text=f"Vault: {os.path.basename(self.vault_path)} (0 entries)"
-            )
-            self.reset_idle_timer()
-
-            messagebox.showinfo("Success", f"Vault created:\n{filename}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to create vault:\n{e}")
-
-    # ------------------------------------------------------------------ #
-    # Відкриття сейфу
-    # ------------------------------------------------------------------ #
     def open_vault(self):
-        filename = filedialog.askopenfilename(
-            filetypes=[("ZVault files", "*.zvault"), ("All files", "*.*")]
+        path = filedialog.askopenfilename(
+            title="Open ZVault",
+            filetypes=[("ZVault Files", "*.zvault"), ("All Files", "*.*")]
         )
-        if not filename:
+        if not path:
             return
 
-        password = simpledialog.askstring(
-            "Master Password",
-            "Enter master password:",
-            show="*",
-            parent=self.root,
-        )
-        if password is None:
-            # натиснуто Cancel
+        pw = self._ask_password("Enter Master Password:")
+        if not pw:
             return
 
         try:
-            # читаємо зашифрований сейф і розшифровуємо entries
-            entries = load_zvault(filename, password)
-
-            # загортаємо список у SimpleVault, щоб далі працювати через self.vault.entries
-            self.vault = SimpleVault(entries)
-            self.vault_path = filename
-            self.master_password = password
-            self.is_locked = False
-
-            # оновлюємо таблицю
-            self.refresh_entries()
-            self.btn_add.config(state="normal")
-            self.btn_save.config(state="normal")
-
-            # меню Vault
-            if hasattr(self, "vault_menu"):
-                try:
-                    self.vault_menu.entryconfig("Lock now", state="normal")
-                    self.vault_menu.entryconfig("Unlock", state="disabled")
-                except Exception:
-                    pass
-
-            # скидаємо таймер неактивності
-            self.reset_idle_timer()
-
-            messagebox.showinfo("Success", "Vault opened successfully.")
+            entries = load_zvault(path, pw)
+            self.vault_entries = entries
+            self.vault_path = path
+            self.master_password = pw
+            self._refresh_table()
+            messagebox.showinfo("OK", "Vault successfully decrypted.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open vault:\n{e}")
 
-    # ------------------------------------------------------------------ #
-    # Блокування / розблокування сейфу
-    # ------------------------------------------------------------------ #
-    def lock_vault(self, auto: bool = False):
-        if not self.vault or self.is_locked:
-            return
-
-        self.is_locked = True
-
-        # кнопки
-        self.btn_add.config(state="disabled")
-        self.btn_save.config(state="disabled")
-
-        # статус
-        self.lock_label.config(text="Locked", foreground="#ff5555")
-        if auto:
-            self.status_label.config(text="Vault locked (idle timeout)")
-            message = "Vault locked due to inactivity."
-        else:
-            self.status_label.config(text="Vault locked")
-            message = "Vault has been locked."
-
-        # очищаємо таблицю
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        self.tree.insert("", "end", values=("*** Vault locked ***", "", ""))
-
-        self.reset_idle_timer()
-
-        if not auto:
-            messagebox.showinfo("Vault locked", message)
-
-    def unlock_vault(self):
-        if not self.vault or not self.is_locked:
-            return
-
-        password = simpledialog.askstring(
-            "Master Password",
-            "Enter master password:",
-            show="*",
-            parent=self.root,
-        )
-        if password is None:
-            return
-
-        try:
-            entries = load_zvault(self.vault_path, password)
-            self.vault = SimpleVault(entries)
-            self.master_password = password
-            self.is_locked = False
-
-            self.refresh_entries()
-            self.btn_add.config(state="normal")
-            self.btn_save.config(state="normal")
-
-            if hasattr(self, "vault_menu"):
-                try:
-                    self.vault_menu.entryconfig("Lock now", state="normal")
-                    self.vault_menu.entryconfig("Unlock", state="disabled")
-                except Exception:
-                    pass
-
-            self.lock_label.config(text="Unlocked", foreground="#00ff00")
-            self.status_label.config(text="Vault unlocked")
-            self.reset_idle_timer()
-
-            messagebox.showinfo("Unlocked", "Vault unlocked.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to unlock vault:\n{e}")
-
-    # ------------------------------------------------------------------ #
-    # Оновлення таблиці
-    # ------------------------------------------------------------------ #
-    def refresh_entries(self):
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        if not self.vault or self.is_locked:
-            return
-
-        entries = getattr(self.vault, "entries", None)
-        if not entries:
-            return
-
-        for entry in entries:
-            title = entry.get("title", "")
-            username = entry.get("username", "")
-            website = entry.get("url", "") or entry.get("website", "")
-            self.tree.insert("", "end", values=(title, username, website))
-
-        self.status_label.config(
-            text=f"Vault: {os.path.basename(self.vault_path)} ({len(entries)} entries)"
-        )
-
-    # ------------------------------------------------------------------ #
-    # Подвійний клік по запису (копіювання пароля в буфер)
-    # ------------------------------------------------------------------ #
-    def on_tree_double_click(self, event):
-        if self.is_locked or not self.vault:
-            return
-
-        item_id = self.tree.focus()
-        if not item_id:
-            return
-
-        index = self.tree.index(item_id)
-        entries = getattr(self.vault, "entries", None) or []
-        if index < 0 or index >= len(entries):
-            return
-
-        entry = entries[index]
-        password = entry.get("password", "")
-        if not password:
-            messagebox.showinfo("Password", "No password set for this entry.")
-            return
-
-        try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(password)
-            self.root.update_idletasks()
-        except Exception as e:
-            messagebox.showerror("Clipboard", f"Failed to copy password:\n{e}")
-            return
-
-        self.status_label.config(text="Password copied to clipboard (will clear in 15s)")
-        self.root.after(15000, self.clear_clipboard)
-
-    def clear_clipboard(self):
-        try:
-            self.root.clipboard_clear()
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        self.status_label.config(text=f"Vault: {os.path.basename(self.vault_path)}")
-
-    # ------------------------------------------------------------------ #
-    # Резервні копії
-    # ------------------------------------------------------------------ #
-    def create_backup(self, path: str):
-        """Створити резервну копію файлу vault перед перезаписом."""
-        if not os.path.exists(path):
-            return
-
-        base_dir = os.path.dirname(path)
-        base_name = os.path.basename(path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{base_name}.{timestamp}.bak"
-        backup_path = os.path.join(base_dir, backup_name)
-
-        try:
-            shutil.copy2(path, backup_path)
-        except Exception:
-            # не валимо GUI, якщо backup не вдався
-            pass
-
-    # ------------------------------------------------------------------ #
-    # Збереження сейфу
-    # ------------------------------------------------------------------ #
-    def save_vault(self, auto: bool = False):
-        """Зберегти сейф у файл. auto=True = тихе автозбереження без вікон."""
-        if not self.vault:
-            if not auto:
-                messagebox.showwarning("No vault", "Open a vault first.")
-            return
-
-        if self.is_locked:
-            if not auto:
-                messagebox.showwarning("Locked", "Unlock vault first.")
-            return
-
-        path = self.vault_path
-        if not path:
-            if auto:
-                return
+    def save_vault(self):
+        if self.vault_path is None:
             path = filedialog.asksaveasfilename(
+                title="Save Vault",
                 defaultextension=".zvault",
-                filetypes=[("ZVault files", "*.zvault"), ("All files", "*.*")],
-                title="Save vault as...",
+                filetypes=[("ZVault Files", "*.zvault")]
             )
             if not path:
                 return
             self.vault_path = path
 
-        # беремо список entries з self.vault
-        entries = getattr(self.vault, "entries", None)
-        if entries is None:
-            if not auto:
-                messagebox.showerror("Error", "Vault has no entries list.")
-            return
+        if not self.master_password:
+            self.master_password = self._ask_password("Set Master Password:")
 
         try:
-            # якщо файл вже існує — робимо резервну копію
-            if os.path.exists(path):
-                self.create_backup(path)
-
-            # шифруємо і записуємо сейф у форматі Z1080/ZVAULT
-            save_zvault(path, self.master_password, entries)
-
-            if not auto:
-                messagebox.showinfo("Saved", f"Vault saved to:\n{path}")
+            save_zvault(self.vault_path, self.master_password, self.vault_entries)
+            messagebox.showinfo("Saved", "Vault saved successfully.")
         except Exception as e:
-            if not auto:
-                messagebox.showerror("Error", f"Failed to save vault:\n{e}")
+            messagebox.showerror("Error", f"Save failed:\n{e}")
 
-    # ------------------------------------------------------------------ #
-    # Додавання нового запису (з генератором паролів)
-    # ------------------------------------------------------------------ #
-    def add_entry_dialog(self):
-        if not self.vault:
-            messagebox.showwarning("No vault", "Open a vault first.")
-            return
+    # ---------------- Add Entry -----------------
 
-        if self.is_locked:
-            messagebox.showwarning("Locked", "Unlock vault first.")
-            return
-
+    def add_entry_window(self):
         win = tk.Toplevel(self.root)
-        win.title("Add New Entry")
-        if self.icon_path:
-            try:
-                win.iconbitmap(self.icon_path)
-            except Exception:
-                pass
+        win.title("Add Entry")
 
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill="both", expand=True)
+        tk.Label(win, text="Title:").grid(row=0, column=0)
+        entry_title = tk.Entry(win, width=30)
+        entry_title.grid(row=0, column=1)
 
-        # Title
-        ttk.Label(frm, text="Title:").grid(row=0, column=0, sticky="e", pady=2)
-        title_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=title_var, width=40).grid(row=0, column=1, sticky="w")
+        tk.Label(win, text="Username:").grid(row=1, column=0)
+        entry_user = tk.Entry(win, width=30)
+        entry_user.grid(row=1, column=1)
 
-        # Username
-        ttk.Label(frm, text="Username:").grid(row=1, column=0, sticky="e", pady=2)
-        username_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=username_var, width=40).grid(row=1, column=1, sticky="w")
+        tk.Label(win, text="URL:").grid(row=2, column=0)
+        entry_url = tk.Entry(win, width=30)
+        entry_url.grid(row=2, column=1)
 
-        # Password
-        ttk.Label(frm, text="Password:").grid(row=2, column=0, sticky="e", pady=2)
-        password_var = tk.StringVar()
-        password_entry = ttk.Entry(frm, textvariable=password_var, width=40, show="*")
-        password_entry.grid(row=2, column=1, sticky="w")
+        tk.Label(win, text="Notes:").grid(row=3, column=0)
+        entry_notes = tk.Entry(win, width=30)
+        entry_notes.grid(row=3, column=1)
 
-        # Генератор паролів
-        gen_frame = ttk.Frame(frm)
-        gen_frame.grid(row=3, column=1, sticky="w", pady=4)
+        # --- Password mode selection ---
+        mode_var = tk.StringVar(value="plain")
+        tk.Label(win, text="Mode:").grid(row=4, column=0)
 
-        ttk.Label(gen_frame, text="Length:").pack(side="left")
-        length_var = tk.IntVar(value=16)
-        length_spin = ttk.Spinbox(gen_frame, from_=4, to=128, textvariable=length_var, width=5)
-        length_spin.pack(side="left", padx=(4, 8))
+        ttk.Radiobutton(win, text="Store password", variable=mode_var, value="plain").grid(row=4, column=1, sticky="w")
+        ttk.Radiobutton(win, text="Z1080 Secret (deterministic)", variable=mode_var, value="glyph").grid(row=5, column=1, sticky="w")
 
-        use_lower = tk.BooleanVar(value=True)
-        use_upper = tk.BooleanVar(value=True)
-        use_digits = tk.BooleanVar(value=True)
-        use_symbols = tk.BooleanVar(value=True)
+        # ---------------- Password field ----------------
+        tk.Label(win, text="Password / Glyph:").grid(row=6, column=0)
+        entry_pass = tk.Entry(win, width=30)
+        entry_pass.grid(row=6, column=1)
 
-        ttk.Checkbutton(gen_frame, text="a-z", variable=use_lower).pack(side="left")
-        ttk.Checkbutton(gen_frame, text="A-Z", variable=use_upper).pack(side="left")
-        ttk.Checkbutton(gen_frame, text="0-9", variable=use_digits).pack(side="left")
-        ttk.Checkbutton(gen_frame, text="!@#", variable=use_symbols).pack(side="left")
+        # --- Generator buttons ---
+        btn_gen_std = tk.Button(win, text="Generate (Std)", command=lambda: entry_pass.insert(0, secrets.token_urlsafe(16)))
+        btn_gen_z1080 = tk.Button(win, text="Generate Z1080 Secret", command=lambda: entry_pass.insert(0, self.generate_unicode_password(24)))
+        btn_copy = tk.Button(win, text="Copy", command=lambda: pyperclip.copy(entry_pass.get()))
 
-        def generate_password():
-            length = length_var.get()
-            alphabet = ""
+        btn_gen_std.grid(row=7, column=0, pady=5)
+        btn_gen_z1080.grid(row=7, column=1, sticky="w")
+        btn_copy.grid(row=7, column=2)
 
-            if use_lower.get():
-                alphabet += string.ascii_lowercase
-            if use_upper.get():
-                alphabet += string.ascii_uppercase
-            if use_digits.get():
-                alphabet += string.digits
-            if use_symbols.get():
-                # дружній набір спецсимволів
-                alphabet += "!@#$%^&*()-_=+[]{};:,.?/"
+        # --- Confirm ---
+        def apply():
+            mode = mode_var.get()
+            password = entry_pass.get() if mode == "plain" else ""
+            glyph = entry_pass.get() if mode == "glyph" else ""
 
-            if length <= 0 or not alphabet:
-                messagebox.showwarning(
-                    "Generator",
-                    "Select character sets and length > 0.",
-                    parent=win,
-                )
-                return
+            self.vault_entries.append({
+                "id": datetime.utcnow().isoformat(),
+                "title": entry_title.get(),
+                "username": entry_user.get(),
+                "url": entry_url.get(),
+                "notes": entry_notes.get(),
+                "password": password,
+                "glyph": glyph,
+                "mode": mode
+            })
+            self._refresh_table()
+            win.destroy()
 
-            pwd = "".join(secrets.choice(alphabet) for _ in range(length))
-            password_var.set(pwd)
-            password_entry.focus_set()
-            password_entry.select_range(0, tk.END)
+        tk.Button(win, text="Add", command=apply).grid(row=8, column=1, pady=10)
 
-        ttk.Button(gen_frame, text="Generate", command=generate_password).pack(
-            side="left", padx=(8, 0)
-        )
+    # ---------------- Helpers -----------------
 
-        # URL + Notes
-        ttk.Label(frm, text="URL:").grid(row=4, column=0, sticky="e", pady=2)
-        url_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=url_var, width=40).grid(row=4, column=1, sticky="w")
+    def generate_unicode_password(self, length: int = 24):
+        return "".join(secrets.choice(UNICODE_ALPHABET) for _ in range(length))
 
-        ttk.Label(frm, text="Notes:").grid(row=5, column=0, sticky="ne", pady=2)
-        notes_txt = tk.Text(frm, width=40, height=4)
-        notes_txt.grid(row=5, column=1, sticky="w")
+    def _refresh_table(self):
+        for row in self.table.get_children():
+            self.table.delete(row)
+        for e in self.vault_entries:
+            self.table.insert("", tk.END, values=(e["title"], e["username"], e["url"], e["mode"]))
 
-        # Кнопки збереження
-        btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=2, pady=(8, 0))
+    @staticmethod
+    def _ask_password(prompt: str):
+        win = tk.Toplevel()
+        win.title("Password Required")
+        tk.Label(win, text=prompt).pack()
+        entry = tk.Entry(win, show="•", width=30)
+        entry.pack(pady=5)
+        result = {"pw": None}
 
-        def on_save():
-            title = title_var.get().strip()
-            username = username_var.get().strip()
-            password = password_var.get()
-            url = url_var.get().strip()
-            notes = notes_txt.get("1.0", "end").strip()
+        def ok():
+            result["pw"] = entry.get()
+            win.destroy()
 
-            if not title:
-                messagebox.showwarning("Validation", "Title is required.", parent=win)
-                return
-
-            try:
-                # Якщо раптом є метод add_entry(...) – використовуємо його
-                if hasattr(self.vault, "add_entry"):
-                    self.vault.add_entry(
-                        title=title,
-                        username=username,
-                        password=password,
-                        url=url,
-                        notes=notes,
-                    )
-                else:
-                    # Інакше працюємо напряму зі списком dict-ів
-                    if not hasattr(self.vault, "entries") or self.vault.entries is None:
-                        self.vault.entries = []
-
-                    new_entry = {
-                        "title": title,
-                        "username": username,
-                        "password": password,
-                        "url": url,
-                        "notes": notes,
-                    }
-                    self.vault.entries.append(new_entry)
-
-                # оновлюємо таблицю
-                self.refresh_entries()
-
-                # автозбереження (тихо)
-                self.save_vault(auto=True)
-
-                # закриваємо діалог
-                win.destroy()
-
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to add entry:\n{e}", parent=win)
-
-        ttk.Button(btns, text="Save", command=on_save).pack(side="left", padx=(0, 5))
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left")
-
-        win.bind("<Return>", lambda event: on_save())
-        frm.grid_columnconfigure(1, weight=1)
-
-    # ------------------------------------------------------------------ #
-    # Експорт / імпорт JSON (для відладки / міграцій)
-    # ------------------------------------------------------------------ #
-    def export_json(self):
-        if not self.vault or self.is_locked:
-            messagebox.showwarning("Export", "Unlock a vault first.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Export entries to JSON...",
-        )
-        if not path:
-            return
-
-        entries = getattr(self.vault, "entries", None) or []
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
-            messagebox.showinfo("Export", f"Entries exported to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export", f"Failed to export JSON:\n{e}")
-
-    def import_json(self):
-        if not self.vault or self.is_locked:
-            messagebox.showwarning("Import", "Unlock a vault first.")
-            return
-
-        path = filedialog.askopenfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Import entries from JSON...",
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            messagebox.showerror("Import", f"Failed to read JSON:\n{e}")
-            return
-
-        # очікуємо {"entries":[...]} або просто [...]
-        if isinstance(data, dict) and "entries" in data:
-            entries = data["entries"]
-        else:
-            entries = data
-
-        if not isinstance(entries, list):
-            messagebox.showerror("Import", "Invalid JSON format (expected list of entries).")
-            return
-
-        imported = 0
-        if not hasattr(self.vault, "entries") or self.vault.entries is None:
-            self.vault.entries = []
-
-        for item in entries:
-            if not isinstance(item, dict):
-                continue
-
-            new_entry = {
-                "title": item.get("title", ""),
-                "username": item.get("username", ""),
-                "password": item.get("password", ""),
-                "url": item.get("url", "") or item.get("website", ""),
-                "notes": item.get("notes", ""),
-            }
-            self.vault.entries.append(new_entry)
-            imported += 1
-
-        self.refresh_entries()
-        self.save_vault(auto=True)
-
-        messagebox.showinfo("Import", f"Imported {imported} entries.")
+        tk.Button(win, text="OK", command=ok).pack(pady=5)
+        win.wait_window()
+        return result["pw"]
 
 
 def main():
     root = tk.Tk()
-    app = ZVaultApp(root)
+    ZVaultApp(root)
     root.mainloop()
 
 
