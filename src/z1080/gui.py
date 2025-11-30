@@ -145,6 +145,10 @@ class ZVaultApp:
         btn_frame = ttk.Frame(top_frame)
         btn_frame.pack(side="left", anchor="w")
 
+        # НОВА КНОПКА: створення сейфа
+        self.btn_create = ttk.Button(btn_frame, text="Create Vault", command=self.create_vault)
+        self.btn_create.pack(side="left", padx=(0, 5))
+
         self.btn_open = ttk.Button(btn_frame, text="Open Vault", command=self.open_vault)
         self.btn_open.pack(side="left", padx=(0, 5))
 
@@ -223,6 +227,74 @@ class ZVaultApp:
 
     def on_idle_timeout(self):
         self.lock_vault(auto=True)
+
+    # ------------------------------------------------------------------ #
+    # Створення нового сейфу
+    # ------------------------------------------------------------------ #
+    def create_vault(self):
+        filename = filedialog.asksaveasfilename(
+            title="Create new vault...",
+            defaultextension=".zvault",
+            filetypes=[("ZVault files", "*.zvault"), ("All files", "*.*")]
+        )
+        if not filename:
+            return
+
+        if not filename.lower().endswith(".zvault"):
+            filename += ".zvault"
+
+        pwd1 = simpledialog.askstring(
+            "Master Password",
+            "Enter new master password:",
+            show="*",
+            parent=self.root,
+        )
+        if not pwd1:
+            messagebox.showwarning("Password", "Master password is required.")
+            return
+
+        pwd2 = simpledialog.askstring(
+            "Confirm Password",
+            "Re-enter master password:",
+            show="*",
+            parent=self.root,
+        )
+        if pwd2 is None or pwd1 != pwd2:
+            messagebox.showerror("Password", "Passwords do not match.")
+            return
+
+        entries = []  # порожній сейф
+
+        try:
+            # створюємо зашифрований файл
+            save_zvault(filename, pwd1, entries)
+
+            # одразу відкриваємо його в GUI
+            self.vault = SimpleVault(entries)
+            self.vault_path = filename
+            self.master_password = pwd1
+            self.is_locked = False
+
+            self.refresh_entries()
+            self.btn_add.config(state="normal")
+            self.btn_save.config(state="normal")
+
+            if hasattr(self, "vault_menu"):
+                try:
+                    self.vault_menu.entryconfig("Lock now", state="normal")
+                    self.vault_menu.entryconfig("Unlock", state="disabled")
+                except Exception:
+                    pass
+
+            self.lock_label.config(text="Unlocked", foreground="#00ff00")
+            self.status_label.config(
+                text=f"Vault: {os.path.basename(self.vault_path)} (0 entries)"
+            )
+            self.reset_idle_timer()
+
+            messagebox.showinfo("Success", f"Vault created:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create vault:\n{e}")
 
     # ------------------------------------------------------------------ #
     # Відкриття сейфу
@@ -709,6 +781,7 @@ class ZVaultApp:
         self.save_vault(auto=True)
 
         messagebox.showinfo("Import", f"Imported {imported} entries.")
+
 
 def main():
     root = tk.Tk()
