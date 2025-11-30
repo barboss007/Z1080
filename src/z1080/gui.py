@@ -8,7 +8,13 @@ import secrets
 import string
 from datetime import datetime
 
-from .crypto import save_zvault, load_zvault  # зашифрований формат
+# --- Імпорти ядра сейфу ---------------------------------------------
+try:
+    # Запуск як пакет: python -m z1080.gui
+    from .crypto import save_zvault, load_zvault
+except ImportError:
+    # Запуск як звичайний скрипт / всередині PyInstaller EXE
+    from crypto import save_zvault, load_zvault
 
 
 class SimpleVault:
