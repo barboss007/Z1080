@@ -10,12 +10,11 @@ from datetime import datetime
 
 # --- Імпорти ядра сейфу ---------------------------------------------
 try:
-    # Запуск як пакет: python -m z1080.gui
-    from .crypto import save_zvault, load_zvault
+    # Звичайний шлях: пакет z1080 (і в EXE, і при python -m z1080.gui)
+    from z1080.crypto import save_zvault, load_zvault
 except ImportError:
-    # Запуск як звичайний скрипт / всередині PyInstaller EXE
-    from crypto import save_zvault, load_zvault
-
+    # Резервний варіант: якщо файл лежить поруч як crypto.py
+    from .crypto import save_zvault, load_zvault
 
 class SimpleVault:
     """Мінімальний контейнер, щоб мати self.vault.entries."""
